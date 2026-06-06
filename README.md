@@ -2,16 +2,17 @@
 
 Web-based guild roster for an EverQuest guild (Project Quarm–style emulator).
 **Google Apps Script backend + a single-file HTML frontend**, fed automatically by the
-guild's Discord bot. It renders the live Google Sheet roster (DKP, raid attendance,
-characters per class, key access…) as a fast, sortable, dark-themed table.
+guild's Discord **DKP bot** ([`konzz/discord-dkp-bot`](https://github.com/konzz/discord-dkp-bot)).
+It renders the live Google Sheet roster (DKP, raid attendance, characters per class,
+key access…) as a fast, sortable, dark-themed table.
 
 ---
 
 ## Architecture
 
 ```
-Discord bot (roster-bot)
-        │  drops backup ZIPs (players.json + raids.json) on Google Drive
+Discord DKP bot  (konzz/discord-dkp-bot)
+        │  "Backup" → ZIP (players.json + raids.json) on Google Drive
         ▼
 Google Apps Script  ──reads──►  Google Sheets ("Roster", "Raw Discord Data", …)
         │                              │
@@ -29,8 +30,9 @@ Google Apps Script  ──reads──►  Google Sheets ("Roster", "Raw Discord 
 
 ## Data flow
 
-1. `roster-bot` periodically uploads a `backup_<YYYYMMDDHHMMSS>.zip` (containing
-   `players.json` + `raids.json`) to a Drive folder.
+1. The [DKP bot](https://github.com/konzz/discord-dkp-bot)'s **Backup** command exports all
+   guild data; it lands in a Drive folder as `backup_<YYYYMMDDHHMMSS>.zip` containing
+   `players.json` + `raids.json` (see [Source data](#source-data--dkp-bot)).
 2. `parseLatestRaidDataAndUpdateRoster()` picks the latest ZIP, computes attendance and
    the last DKP-gain date, and writes everything into the **Roster** sheet
    (`completeRosterFromDiscord`), then appends new raids to **Raid Summary**.
@@ -38,6 +40,70 @@ Google Apps Script  ──reads──►  Google Sheets ("Roster", "Raw Discord 
    kept warm by a 1-minute trigger.
 4. `index.html` fetches that JSON and renders the grid (sticky headers, frozen columns,
    per-cell styling, note tooltips, sortable columns).
+
+## Source data — DKP bot
+
+The roster is fed by the **[konzz/discord-dkp-bot](https://github.com/konzz/discord-dkp-bot)**
+(a MongoDB-backed EverQuest DKP bot). Its **Backup** command exports all guild data as JSON;
+that export must land on Google Drive as `backup_<YYYYMMDDHHMMSS>.zip` (newest by the
+timestamp in the name wins) and must contain two files: **`players.json`** and
+**`raids.json`**.
+
+You don't strictly need that exact bot — any source works as long as the two files expose
+the fields below. **These are the only fields this project reads** (the integration
+contract); anything else in the export is ignored.
+
+> **Join key:** `player` — a Discord user ID — ties the whole system together. It must equal
+> the `Discord ID:` stored in the Roster column-A cell notes and the `ID` column of the
+> **Raw Discord Data** sheet. Names can change; this ID is the stable key.
+
+### `players.json` — array of players
+
+```jsonc
+[
+  {
+    "player":  "207334980625302938",   // REQUIRED — Discord user ID (the join key)
+    "current": 1840,                    // current DKP balance        → Roster "DKP" column
+    "log": [                            // DKP history
+      {
+        "date": 1733000000000,          // epoch ms
+        "dkp":  50,                     // delta: > 0 = gain, < 0 = spend
+        "raid": { "_id": "65a1f0c2e4b0..." }  // raid this entry belongs to
+      }
+    ]
+  }
+]
+```
+
+Read for: current DKP (`current`); **last DKP-gain date** → Roster "Activity" (latest
+`log[].date` where `log[].dkp > 0`); **DKP spent per raid** → Raid Summary
+(`log[].dkp < 0` grouped by `log[].raid._id`).
+
+### `raids.json` — array of raids
+
+```jsonc
+[
+  {
+    "_id":          "65a1f0c2e4b0...",   // raid ID (referenced by players' log[].raid._id)
+    "name":         "Sleeper's Tomb",    // → Raid Summary
+    "date":         1733000000000,       // epoch ms (optional; falls back to attendance[0].date)
+    "dkpsPerTick":  5,                   // optional — default DKP per tick for this raid
+    "tickDuration": 1800000,             // optional — ms per tick (used for duration)
+    "attendance": [                      // timeline of events
+      {
+        "date":    1733000000000,        // epoch ms
+        "comment": "Tick",               // "Start" / "Tick" count toward attendance & earned DKP; others ignored
+        "players": ["207334980625302938", "198021040..."],  // Discord IDs present at this event
+        "dkps":    5                     // optional — DKP for this event (else dkpsPerTick)
+      }
+    ]
+  }
+]
+```
+
+Read for: **attendance / RA** (share of `Start`+`Tick` events attended — averaged over the
+best 8 of the last 10 weeks); **earned DKP** and **duration** per raid → Raid Summary;
+**tick counts** → Roster tick stats.
 
 ## Repository layout
 
