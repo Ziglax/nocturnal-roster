@@ -1,5 +1,5 @@
-# Claude Code local settings (machine-specific permissions/paths)
-.claude/settings.local.json
+# Claude Code local config/tooling
+.claude/
 
 # OS / editor noise
 .DS_Store
