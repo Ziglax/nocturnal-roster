@@ -133,6 +133,10 @@
       }
 
       /* --- TOOLTIPS (NOTES) --- */
+      /* Anchor the corner triangle to the cell itself. Without this, non-sticky
+         cells are position:static and the ::after resolves against the scroll
+         container instead. (Sticky cells keep position:sticky via !important.) */
+      .has-note { position: relative; }
       .has-note::after {
         content: ''; position: absolute; top: 0; right: 0;
         border-width: 0 5px 5px 0; border-style: solid;
@@ -229,13 +233,29 @@
       let sourceWidths = null; // Caches initial column widths for resizing logic
 
       // Local cache key: lets us render the table instantly on the next visit,
-      // while the fresh data loads in the background.
-      const LOCAL_DATA_KEY = "roster_data_cache";
+      // while the fresh data loads in the background. Versioned: bump the suffix
+      // whenever the payload shape changes so stale caches are discarded, not rendered.
+      const LOCAL_DATA_KEY = "roster_data_cache_v2";
+
+      // The backend returns HTTP 200 + {error:...} on failure, and an old cache may
+      // predate the current payload shape — validate everything the renderer
+      // dereferences before caching or rendering.
+      function isValidPayload(d) {
+        return !!d && !d.error
+            && Array.isArray(d.values) && d.values.length > HEADER_IDX
+            && Array.isArray(d.notes) && Array.isArray(d.styleDict)
+            && Array.isArray(d.styleIndex) && Array.isArray(d.headerHeights);
+      }
 
       function loadLocalData() {
         try {
           const txt = localStorage.getItem(LOCAL_DATA_KEY);
-          return txt ? JSON.parse(txt) : null;
+          const data = txt ? JSON.parse(txt) : null;
+          if (data && !isValidPayload(data)) {
+            localStorage.removeItem(LOCAL_DATA_KEY); // poisoned/stale cache: self-heal
+            return null;
+          }
+          return data;
         } catch (e) {
           return null;
         }
@@ -249,6 +269,9 @@
        */
       window.onload = function() {
         console.log("App Ready.");
+
+        // Drop the pre-v2 cache key so it doesn't linger in storage.
+        try { localStorage.removeItem('roster_data_cache'); } catch (e) {}
 
         // Recompute sticky headers on resize (registered once).
         window.addEventListener('resize', () => {
@@ -319,8 +342,17 @@
             })
             .then(text => {
                 const data = JSON.parse(text);
-                const prev = localStorage.getItem(LOCAL_DATA_KEY);
-                try { localStorage.setItem(LOCAL_DATA_KEY, text); } catch (e) {}
+                // Backend soft error (HTTP 200 + {error:...}) or truncated payload:
+                // never cache it, never render it.
+                if (!isValidPayload(data)) {
+                    if (!silent) showRetry(url, (data && (data.details || data.error)) || "invalid data");
+                    return;
+                }
+                let prev = null;
+                try {
+                    prev = localStorage.getItem(LOCAL_DATA_KEY);
+                    localStorage.setItem(LOCAL_DATA_KEY, text);
+                } catch (e) {} // storage unavailable (private mode/quota): still render
 
                 if (silent) {
                     // Only re-render if the data actually changed.
@@ -332,12 +364,7 @@
             .catch(e => {
                 console.error(e);
                 // In silent mode, just keep the local cache view.
-                if (!silent) {
-                    // On failure, allow user to re-enter URL
-                    document.getElementById('loader').style.display = 'none';
-                    document.getElementById('setup-overlay').style.display = 'flex';
-                    alert("Load error. Please check the script URL.\n" + e.message);
-                }
+                if (!silent) showRetry(url, e.message);
             });
       }
 
@@ -359,23 +386,56 @@
       }
 
       /**
+       * Friendly failure state with a click-to-retry — guild members must never
+       * land on the developer setup overlay because of a transient network error.
+       */
+      function showRetry(url, msg) {
+          const lt = document.getElementById('loading-text');
+          lt.innerText = "Connection failed" + (msg ? " (" + msg + ")" : "") + " — click here to retry";
+          lt.style.color = "#e74c3c";
+          lt.style.cursor = "pointer";
+          lt.onclick = () => {
+              lt.onclick = null;
+              lt.style.color = "";
+              lt.style.cursor = "";
+              fetchFromExternal(url, false);
+          };
+          document.getElementById('loader').style.display = 'flex';
+      }
+
+      /**
        * --- CORE APP LOGIC ---
        * Initializes the application once data is received.
        * @param {Object} data - The JSON data object from the backend.
        */
       function initApp(data, silent) {
+        // Guards the google.script.run path too — the fetch paths pre-validate.
+        if (!isValidPayload(data)) {
+            if (!silent) showError("Invalid data received");
+            return;
+        }
         rawData = data;
 
         // Silent refresh (data updated in the background): re-render in place,
-        // without the loader, preserving the user's scroll position.
+        // without the loader, preserving the user's scroll position and sort.
         if (silent) {
             const c = document.getElementById('container');
             const sx = c.scrollLeft, sy = c.scrollTop;
             renderTable();
+            // renderTable rebuilds in sheet order: re-apply the user's active sort.
+            if (sortConfig.col >= 0) {
+                if (sortConfig.col < rawData.values[HEADER_IDX].length) applySort();
+                else sortConfig = { col: -1, asc: true }; // sorted column disappeared
+            }
             requestAnimationFrame(() => {
-                freezeTableDimensions(false);
-                c.scrollLeft = sx;
-                c.scrollTop = sy;
+                try { freezeTableDimensions(false); }
+                finally {
+                    c.scrollLeft = sx;
+                    c.scrollTop = sy;
+                    // Defensive: if a previous render had stranded the UI, un-strand it.
+                    c.style.opacity = '1';
+                    document.getElementById('loader').style.display = 'none';
+                }
             });
             return;
         }
@@ -384,14 +444,22 @@
 
         // Use setTimeout to allow UI to update (show "Building...") before heavy DOM ops
         setTimeout(() => {
-            renderTable();
+            try {
+                renderTable();
 
-            // Wait for next frame to ensure DOM is painted, then calculate dimensions
-            requestAnimationFrame(() => {
-                freezeTableDimensions(true);
-                document.getElementById('container').style.opacity = '1';
-                document.getElementById('loader').style.display = 'none';
-            });
+                // Wait for next frame to ensure DOM is painted, then calculate dimensions
+                requestAnimationFrame(() => {
+                    // Reveal in a finally: a layout failure must never strand the spinner.
+                    try { freezeTableDimensions(true); }
+                    finally {
+                        document.getElementById('container').style.opacity = '1';
+                        document.getElementById('loader').style.display = 'none';
+                    }
+                });
+            } catch (e) {
+                console.error(e);
+                showError(e.message); // render crash: show it instead of an endless spinner
+            }
         }, 50);
       }
 
@@ -400,6 +468,9 @@
        * Uses document fragments/elements for better performance than innerHTML.
        */
       function renderTable() {
+        // Invalidate the width cache: fresh data may change column count/widths.
+        // (The resize path never re-renders, so it keeps benefiting from the cache.)
+        sourceWidths = null;
         const table = document.getElementById('rosterTable');
         table.innerHTML = '';
         table.style.width = 'auto';
@@ -485,8 +556,6 @@
        * Sets up interactivity (sorting, tooltips) and sticky classes.
        */
       function setupCellLogic(el, r, c, isSortRow) {
-        el.title = el.textContent; // Default browser tooltip
-
         // Assign sticky classes based on position
         if (r < FROZEN_ROWS && c < FROZEN_COLS) {
             el.className = 'sticky-corner'; // Top-Left intersection
@@ -511,13 +580,16 @@
             el.classList.add('matrix-cell');
         }
 
-        // Custom Tooltip (Note) logic
+        // Custom Tooltip (Note) logic. Native title only when there is NO note,
+        // so note cells don't show two overlapping tooltips at once.
         const note = rawData.notes[r][c];
         if (note) {
             el.classList.add('has-note');
             el.dataset.note = note;
             el.onmouseenter = showTooltip;
             el.onmouseleave = hideTooltip;
+        } else {
+            el.title = el.textContent; // native tooltip for truncated cells
         }
       }
 
@@ -531,7 +603,9 @@
       function freezeTableDimensions(isFirstRun = false) {
         const table = document.getElementById('rosterTable');
         const rows = table.rows;
-        if (rows.length === 0) return;
+        // Need the header row to measure — also protects the resize listener
+        // against degenerate tables (fewer rows than HEADER_IDX+1).
+        if (rows.length <= HEADER_IDX) return;
 
         // 1. Capture Source Widths (First run only)
         // We rely on the browser's "auto" layout to tell us how wide columns want to be.
@@ -660,7 +734,15 @@
         // Toggle sort direction
         if (sortConfig.col === colIdx) sortConfig.asc = !sortConfig.asc;
         else { sortConfig.col = colIdx; sortConfig.asc = true; }
-        
+        applySort();
+      }
+
+      /**
+       * Applies the current sortConfig to the tbody rows (no direction toggle).
+       * Called by header clicks and after a silent re-render to preserve the sort.
+       */
+      function applySort() {
+        const colIdx = sortConfig.col;
         updateHeaderIcons();
 
         const tbody = document.getElementById('tbody');
