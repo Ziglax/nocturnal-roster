@@ -3,7 +3,8 @@
   <head>
     <!-- No <base target="_top"> here to allow external hosting flexibility. -->
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <!-- Pinch-zoom stays enabled: cell text is small and truncated, users need to zoom. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap" rel="stylesheet">
     <title>Nocturnal Roster</title>
     <style>
@@ -121,6 +122,23 @@
         font-size: 10px; margin-left: 4px; opacity: 0.3; display: inline-block;
       }
       .sort-header.active-sort .sort-icon { opacity: 1; color: #d4af37; }
+      .sort-header:focus-visible { outline: 2px solid #d4af37; outline-offset: -2px; }
+
+      /* --- TOOLBAR (player filter) --- */
+      #toolbar {
+        flex: 0 0 auto;
+        display: flex; align-items: center; justify-content: flex-end; gap: 10px;
+        padding: 5px 10px;
+        background: #1a1a1a; border-bottom: 1px solid #2a2a2a;
+      }
+      #filter-count { color: #888; font-size: 12px; }
+      #filter-input {
+        width: 200px; max-width: 50vw;
+        padding: 5px 10px;
+        background: #111; border: 1px solid #444; border-radius: 4px;
+        color: #e0e0e0; font-size: 13px;
+      }
+      #filter-input:focus { outline: none; border-color: #d4af37; }
 
       /* --- LINK CELLS (HYPERLINK formulas in the sheet) --- */
       td a, th a {
@@ -203,6 +221,12 @@
         </div>
     </div>
 
+    <!-- TOOLBAR (player filter) -->
+    <div id="toolbar">
+      <span id="filter-count"></span>
+      <input type="search" id="filter-input" placeholder="Filter players…" aria-label="Filter players" autocomplete="off">
+    </div>
+
     <!-- MAIN DATA CONTAINER -->
     <div class="table-container" id="container">
       <table id="rosterTable"></table>
@@ -231,6 +255,8 @@
       let rawData = null;      // Stores data fetched from backend
       let sortConfig = { col: -1, asc: true };
       let sourceWidths = null; // Caches initial column widths for resizing logic
+      let externalUrl = null;  // Set in external mode; enables visibility-based refresh
+      let lastVisibilityRefresh = 0; // Throttles the visibilitychange refetch
 
       // Local cache key: lets us render the table instantly on the next visit,
       // while the fresh data loads in the background. Versioned: bump the suffix
@@ -278,6 +304,22 @@
             requestAnimationFrame(() => freezeTableDimensions(false));
         });
 
+        // Long-lived tabs go stale: refresh silently when the tab becomes visible
+        // again (throttled — the backend cache makes this a cheap ~2s HIT).
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState !== 'visible' || !externalUrl || !rawData) return;
+            if (Date.now() - lastVisibilityRefresh < 60000) return;
+            lastVisibilityRefresh = Date.now();
+            fetchFromExternal(externalUrl, true);
+        });
+
+        // Player filter box.
+        const fi = document.getElementById('filter-input');
+        fi.addEventListener('input', applyFilter);
+        fi.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') { fi.value = ''; applyFilter(); fi.blur(); }
+        });
+
         // Scenario 1: Running inside Google Apps Script environment
         if (typeof google !== 'undefined' && google.script && google.script.run) {
             document.getElementById('loading-text').innerText = "Loading via Google Script...";
@@ -292,6 +334,7 @@
             const targetUrl = SCRIPT_URL || localStorage.getItem('roster_script_url');
 
             if (targetUrl) {
+                externalUrl = targetUrl; // enables the visibilitychange refresh
                 // Repeat visit: render the cached table immediately,
                 // then refresh silently in the background.
                 const cached = loadLocalData();
@@ -401,6 +444,25 @@
               fetchFromExternal(url, false);
           };
           document.getElementById('loader').style.display = 'flex';
+      }
+
+      /**
+       * Hides tbody rows that don't match the filter query (matches anywhere in
+       * the row, so typing a character name finds its player's row). Re-applied
+       * after every render since re-renders rebuild the rows.
+       */
+      function applyFilter() {
+        const tbody = document.getElementById('tbody');
+        if (!tbody) return;
+        const q = document.getElementById('filter-input').value.trim().toLowerCase();
+        let shown = 0;
+        for (const row of tbody.rows) {
+            const match = !q || row.textContent.toLowerCase().includes(q);
+            row.style.display = match ? '' : 'none';
+            if (match) shown++;
+        }
+        document.getElementById('filter-count').textContent =
+            q ? shown + " / " + tbody.rows.length : "";
       }
 
       /**
@@ -527,6 +589,9 @@
 
         table.appendChild(thead);
         table.appendChild(tbody);
+
+        // Re-renders rebuild all rows: re-apply the active filter.
+        applyFilter();
       }
 
       /**
@@ -568,11 +633,15 @@
             el.dataset.c = c;
         }
 
-        // Header click logic
+        // Header click logic (also reachable by keyboard: Tab + Enter/Space)
         if (isSortRow) {
             el.classList.add('sort-header');
             el.dataset.colidx = c;
             el.onclick = () => sortData(c);
+            el.tabIndex = 0;
+            el.onkeydown = (e) => {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); sortData(c); }
+            };
         }
 
         // Matrix area specific class
@@ -795,9 +864,11 @@
               if (!icon) return;
               if (parseInt(th.dataset.colidx) === sortConfig.col) {
                   th.classList.add('active-sort');
+                  th.setAttribute('aria-sort', sortConfig.asc ? 'ascending' : 'descending');
                   icon.textContent = sortConfig.asc ? ' ▲' : ' ▼';
               } else {
                   th.classList.remove('active-sort');
+                  th.removeAttribute('aria-sort');
                   icon.textContent = '↕';
               }
           });
@@ -809,15 +880,16 @@
       function showTooltip(e) {
         tip.innerText = e.target.dataset.note;
         tip.style.display = 'block';
-        
-        // Positioning logic to prevent tooltip overflow
-        let x = e.clientX + 15; 
+
+        // Position, clamped to the viewport (measured width — no hardcoded guess,
+        // and never pushed off-screen left on narrow mobile viewports).
+        let x = e.clientX + 15;
         let y = e.clientY + 15;
-        
-        if(x + 260 > window.innerWidth) x -= 270;
-        if(y + tip.offsetHeight > window.innerHeight) y -= tip.offsetHeight;
-        
-        tip.style.left = x + 'px'; 
+
+        if (x + tip.offsetWidth > window.innerWidth) x = Math.max(4, window.innerWidth - tip.offsetWidth - 4);
+        if (y + tip.offsetHeight > window.innerHeight) y = Math.max(4, y - tip.offsetHeight - 30);
+
+        tip.style.left = x + 'px';
         tip.style.top = y + 'px';
       }
       
