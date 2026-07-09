@@ -124,20 +124,19 @@
       .sort-header.active-sort .sort-icon { opacity: 1; color: #d4af37; }
       .sort-header:focus-visible { outline: 2px solid #d4af37; outline-offset: -2px; }
 
-      /* --- TOOLBAR (player filter) --- */
-      #toolbar {
-        flex: 0 0 auto;
-        display: flex; align-items: center; justify-content: flex-end; gap: 10px;
-        padding: 5px 10px;
-        background: #1a1a1a; border-bottom: 1px solid #2a2a2a;
+      /* --- PLAYER FILTER (lives inside the frozen top-left corner of the table) --- */
+      #filter-box {
+        display: flex; align-items: center; gap: 4px;
+        width: 100%;
       }
-      #filter-count { color: #888; font-size: 12px; }
+      #filter-count { color: #888; font-size: 10px; white-space: nowrap; }
       #filter-input {
-        width: 200px; max-width: 50vw;
-        padding: 5px 10px;
-        background: #111; border: 1px solid #444; border-radius: 4px;
-        color: #e0e0e0; font-size: 13px;
+        flex: 1; min-width: 0;
+        height: 16px; padding: 1px 6px;
+        background: #111; border: 1px solid #444; border-radius: 3px;
+        color: #e0e0e0; font-size: 11px;
       }
+      #filter-input::placeholder { color: #666; }
       #filter-input:focus { outline: none; border-color: #d4af37; }
 
       /* --- LINK CELLS (HYPERLINK formulas in the sheet) --- */
@@ -221,10 +220,12 @@
         </div>
     </div>
 
-    <!-- TOOLBAR (player filter) -->
-    <div id="toolbar">
+    <!-- PLAYER FILTER: a persistent node that renderTable installs into the frozen
+         top-left corner of the table (row FILTER_ROW). Starts here, hidden by the
+         full-screen loader until the first render moves it into place. -->
+    <div id="filter-box">
+      <input type="search" id="filter-input" placeholder="Filter…" aria-label="Filter players" autocomplete="off">
       <span id="filter-count"></span>
-      <input type="search" id="filter-input" placeholder="Filter players…" aria-label="Filter players" autocomplete="off">
     </div>
 
     <!-- MAIN DATA CONTAINER -->
@@ -250,6 +251,8 @@
       const FROZEN_COLS = 3;   // Number of columns to freeze at the left
       const MATRIX_START = 3;  // Matrix start column index (e.g., Col D)
       const MATRIX_END = 17;   // Matrix end column index (e.g., Col R)
+      const FILTER_ROW = 2;    // Frozen-corner row hosting the filter box (the empty
+                               // row between the sheet title and "Raid force")
 
       // State Management
       let rawData = null;      // Stores data fetched from backend
@@ -257,6 +260,10 @@
       let sourceWidths = null; // Caches initial column widths for resizing logic
       let externalUrl = null;  // Set in external mode; enables visibility-based refresh
       let lastVisibilityRefresh = 0; // Throttles the visibilitychange refetch
+      let filterBox = null, filterInput = null; // Persistent filter widget (set at onload).
+      // Kept as JS references: renderTable wipes the table (innerHTML=''), which would
+      // destroy the widget — we rescue the same node and re-install it after each build,
+      // so the typed value and listeners survive re-renders.
 
       // Local cache key: lets us render the table instantly on the next visit,
       // while the fresh data loads in the background. Versioned: bump the suffix
@@ -313,11 +320,12 @@
             fetchFromExternal(externalUrl, true);
         });
 
-        // Player filter box.
-        const fi = document.getElementById('filter-input');
-        fi.addEventListener('input', applyFilter);
-        fi.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') { fi.value = ''; applyFilter(); fi.blur(); }
+        // Player filter box (persistent node, re-installed into the table by renderTable).
+        filterBox = document.getElementById('filter-box');
+        filterInput = document.getElementById('filter-input');
+        filterInput.addEventListener('input', applyFilter);
+        filterInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') { filterInput.value = ''; applyFilter(); filterInput.blur(); }
         });
 
         // Scenario 1: Running inside Google Apps Script environment
@@ -453,15 +461,15 @@
        */
       function applyFilter() {
         const tbody = document.getElementById('tbody');
-        if (!tbody) return;
-        const q = document.getElementById('filter-input').value.trim().toLowerCase();
+        if (!tbody || !filterInput) return;
+        const q = filterInput.value.trim().toLowerCase();
         let shown = 0;
         for (const row of tbody.rows) {
             const match = !q || row.textContent.toLowerCase().includes(q);
             row.style.display = match ? '' : 'none';
             if (match) shown++;
         }
-        document.getElementById('filter-count').textContent =
+        filterBox.querySelector('#filter-count').textContent =
             q ? shown + " / " + tbody.rows.length : "";
       }
 
@@ -533,6 +541,9 @@
         // Invalidate the width cache: fresh data may change column count/widths.
         // (The resize path never re-renders, so it keeps benefiting from the cache.)
         sourceWidths = null;
+        // The filter widget lives inside the table: remember focus before the wipe
+        // (the node itself survives — we hold a JS reference and re-install it below).
+        const hadFilterFocus = filterInput && document.activeElement === filterInput;
         const table = document.getElementById('rosterTable');
         table.innerHTML = '';
         table.style.width = 'auto';
@@ -590,8 +601,42 @@
         table.appendChild(thead);
         table.appendChild(tbody);
 
-        // Re-renders rebuild all rows: re-apply the active filter.
+        // Install the filter widget into the frozen corner, restore focus if the
+        // user was typing, and re-apply the active filter to the fresh rows.
+        installFilterBox(table);
+        if (hadFilterFocus) filterInput.focus();
         applyFilter();
+      }
+
+      /**
+       * Hosts the filter widget in the frozen top-left corner: merges the three
+       * frozen cells of row FILTER_ROW (empty in the sheet, between the title and
+       * "Raid force") into one cell and moves the persistent #filter-box into it.
+       * The host keeps its sticky-corner class and dataset.c=0, so sticky offsets
+       * keep working. Re-run after every rebuild.
+       */
+      function installFilterBox(table) {
+        if (!filterBox) return;
+        const row = table.rows[FILTER_ROW];
+        if (!row || !row.cells.length) return;
+        const host = row.cells[0];
+        // The host cell may hold INVISIBLE flavor text (same font and background
+        // color — the sheet's hidden-motto easter egg). Covering that loses nothing;
+        // real visible content must never be overwritten.
+        const st = rawData.styleDict[rawData.styleIndex[FILTER_ROW][0]];
+        const hostText = host.textContent.trim();
+        if (hostText !== '' && st.fc !== st.bg) return; // visible content: don't touch
+        if (hostText) filterBox.title = hostText;       // keep the easter egg as a tooltip
+        host.textContent = '';
+        // Merge only EMPTY neighbor cells (stops at real content like the "M" label),
+        // capped to the frozen columns.
+        let span = 1;
+        while (span < FROZEN_COLS && row.cells.length > 1 && row.cells[1].textContent.trim() === '') {
+            row.deleteCell(1);
+            span++;
+        }
+        host.colSpan = span;
+        host.appendChild(filterBox);
       }
 
       /**
