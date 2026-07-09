@@ -158,15 +158,22 @@
         color: #d4af37;
       }
 
-      /* --- TOOLTIPS (NOTES) --- */
-      /* Anchor the corner triangle to the cell itself. Without this, non-sticky
-         cells are position:static and the ::after resolves against the scroll
-         container instead. (Sticky cells keep position:sticky via !important.) */
-      .has-note { position: relative; }
+      /* --- CELL CORNER INDICATORS --- */
+      /* Anchor the corner triangles to the cell itself. Without this, non-sticky
+         cells are position:static and the pseudo-elements resolve against the
+         scroll container instead. (Sticky cells keep position:sticky via !important.) */
+      .has-note, .has-quarmy { position: relative; }
+      /* Note indicator: yellow, top-right */
       .has-note::after {
         content: ''; position: absolute; top: 0; right: 0;
         border-width: 0 5px 5px 0; border-style: solid;
         border-color: transparent #f1c40f transparent transparent;
+      }
+      /* Quarmy profile indicator: Quarmy brand blue (--accent-blue on quarmy.com), top-left */
+      .has-quarmy::before {
+        content: ''; position: absolute; top: 0; left: 0;
+        border-width: 5px 5px 0 0; border-style: solid;
+        border-color: #6cf transparent transparent transparent;
       }
       #tooltip {
         position: fixed; display: none;
@@ -706,6 +713,13 @@
             el.onmouseleave = hideTooltip;
         } else {
             el.title = el.textContent; // native tooltip for truncated cells
+        }
+
+        // Quarmy profile indicator: blue top-left corner when the cell links
+        // to a quarmy.com profile (opposite corner from the note triangle).
+        const cellLink = rawData.links && rawData.links[r] && rawData.links[r][c];
+        if (cellLink && /quarmy\.com/i.test(cellLink)) {
+            el.classList.add('has-quarmy');
         }
       }
 
