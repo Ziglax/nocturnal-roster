@@ -126,10 +126,19 @@
 
       /* --- PLAYER FILTER (lives inside the frozen top-left corner of the table) --- */
       #filter-box {
-        display: flex; align-items: center; gap: 4px;
+        display: flex; align-items: center;
+        position: relative;
         width: 100%;
       }
-      #filter-count { color: #888; font-size: 10px; white-space: nowrap; }
+      /* The count overlays the right side of the input (out of the flex flow), so its
+         appearance never resizes or shifts the field. Same background as the input to
+         cleanly mask text scrolling underneath. */
+      #filter-count {
+        position: absolute; right: 5px; top: 50%; transform: translateY(-50%);
+        color: #888; font-size: 10px; white-space: nowrap;
+        background: #111; padding-left: 4px;
+        pointer-events: none;
+      }
       #filter-input {
         flex: 1; min-width: 0;
         height: 16px; padding: 1px 6px;
