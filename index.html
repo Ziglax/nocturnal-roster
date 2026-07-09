@@ -628,14 +628,7 @@
         if (hostText !== '' && st.fc !== st.bg) return; // visible content: don't touch
         if (hostText) filterBox.title = hostText;       // keep the easter egg as a tooltip
         host.textContent = '';
-        // Merge only EMPTY neighbor cells (stops at real content like the "M" label),
-        // capped to the frozen columns.
-        let span = 1;
-        while (span < FROZEN_COLS && row.cells.length > 1 && row.cells[1].textContent.trim() === '') {
-            row.deleteCell(1);
-            span++;
-        }
-        host.colSpan = span;
+        // Column A only: keeps the widget aligned with the title above it.
         host.appendChild(filterBox);
       }
 
