@@ -118,25 +118,30 @@ function isoWeekKey(ms, tz) {
  * for regulars. Weeks with no guild raids don't exist as buckets and never
  * count against anyone (windows are counted in RAID-weeks, not calendar weeks).
  *
- * Returns { ra, lifetime, ra12 }, each mapping discordId -> integer percent:
- *  - ra:       "raid RA" over ALL guild ticks of the last 10 raid-weeks (the
- *              in-progress week included, weighted by its ticks so far). New
- *              joiners ramp up as they accumulate ticks — intended; lifetime
- *              offers the per-player view. The player's 2 worst weeks are
- *              forgiven ("best 8 of 10"). Shown in the Roster RA column;
- *              drives DKP-list eligibility.
- *  - ra12:     same rule over the last 12 raid-weeks.
- *  - lifetime: plain ratio (no drop) since the player's first attended week,
- *              capped at the last 365 days.
+ * Returns { ra, d30 }, each mapping discordId -> integer percent:
+ *  - ra:  "raid RA" over ALL guild ticks of the last 10 raid-weeks (the
+ *         in-progress week included, weighted by its ticks so far). New
+ *         joiners ramp up as they accumulate ticks — intended; 30d RA offers
+ *         the short-term view. The player's 2 worst weeks are forgiven
+ *         ("best 8 of 10"). Shown in the Roster RA column; drives DKP-list
+ *         eligibility.
+ *  - d30: plain ratio (no drop) of attended vs total guild events since
+ *         day -30 exactly — or since the player's first tick if they joined
+ *         more recently. Day-precise timestamps, no week bucketing.
  */
 function calculateAttendance(raidsData) {
   const tz = Session.getScriptTimeZone();
-  const currentWeek = isoWeekKey(Date.now(), tz);
+  const now = Date.now();
+  const currentWeek = isoWeekKey(now, tz);
   const isTickOrStart = (c) => c === "Tick" || c === "Start";
 
   // --- Bucket every qualifying event by ISO week (full history) ---
   const weekTotals = {};       // weekKey -> total qualifying events
   const weekPlayerCounts = {}; // weekKey -> { playerId -> events attended }
+  // Day-precise accumulators for 30d RA (that metric ignores week bucketing).
+  const d30Start = now - 30 * 86400000;
+  const firstSeen = {};        // playerId -> earliest qualifying event timestamp
+  const recentEvents = [];     // qualifying events of the last 30 days
 
   // Memoize week keys per hour bucket: isoWeekKey costs one Utilities.formatDate
   // Java-bridge call, and the full-history scan has ~thousands of events. Safe
@@ -161,6 +166,11 @@ function calculateAttendance(raidsData) {
       const wk = weekKeyOf(t);
       if (wk > currentWeek) continue; // future-dated noise: ignore
 
+      for (const pid of players) {
+        if (firstSeen[pid] === undefined || t < firstSeen[pid]) firstSeen[pid] = t;
+      }
+      if (t >= d30Start && t <= now) recentEvents.push({ t, players: new Set(players) });
+
       weekTotals[wk] = (weekTotals[wk] || 0) + 1;
       if (!weekPlayerCounts[wk]) weekPlayerCounts[wk] = {};
       for (const pid of players) {
@@ -170,8 +180,8 @@ function calculateAttendance(raidsData) {
   }
 
   const weeks = Object.keys(weekTotals).sort(); // chronological ("YYYY-Www")
-  const ra = {}, lifetime = {}, ra12 = {};
-  if (!weeks.length) return { ra, lifetime, ra12 };
+  const ra = {}, d30 = {};
+  if (!weeks.length) return { ra, d30 };
 
   const seen = new Set();
   weeks.forEach(wk => Object.keys(weekPlayerCounts[wk]).forEach(pid => seen.add(pid)));
@@ -190,7 +200,7 @@ function calculateAttendance(raidsData) {
 
   // "raid RA" over ALL guild ticks of the last n raid-weeks — the same window
   // for everyone: a new joiner ramps up as they accumulate ticks (intended;
-  // 1y RA offers the per-player perspective). The player's 2 WORST weeks are
+  // 30d RA offers the short-term perspective). The player's 2 WORST weeks are
   // forgiven ("best 8 of 10"): lowest weekly % first; on ties the heavier week
   // (more total ticks) is dropped, which favors the player and stays
   // deterministic. (The length guard only avoids degenerate data.)
@@ -206,22 +216,60 @@ function calculateAttendance(raidsData) {
     return ratio(pid, wks);
   };
 
-  // Lifetime RA looks back one year at most.
-  const yearCutoff = isoWeekKey(Date.now() - 365 * 86400000, tz);
-  let yearStartIdx = weeks.findIndex(wk => wk >= yearCutoff);
-  if (yearStartIdx === -1) yearStartIdx = weeks.length;
-
   for (const pid of seen) {
-    ra[pid]   = raidRa(pid, 10);
-    ra12[pid] = raidRa(pid, 12);
-    // lifetime: since the player's first attended week, capped at the last year
-    const firstIdx = weeks.findIndex(wk => (weekPlayerCounts[wk][pid] || 0) > 0);
-    lifetime[pid] = ratio(pid, weeks.slice(Math.max(firstIdx, yearStartIdx)));
+    ra[pid] = raidRa(pid, 10);
+
+    // d30: day-precise ratio — attended vs total guild events since day -30,
+    // or since the player's first tick if they joined more recently.
+    const from = Math.max(firstSeen[pid], d30Start);
+    let attended = 0, total = 0;
+    for (const ev of recentEvents) {
+      if (ev.t < from) continue;
+      total++;
+      if (ev.players.has(pid)) attended++;
+    }
+    d30[pid] = total ? Math.floor((attended / total) * 100 + 1e-9) : 0;
   }
 
-  return { ra, lifetime, ra12 };
+  return { ra, d30 };
 }
 
+
+/**
+ * Lifetime DKP stats per player, from the bot's full log:
+ *  - earned: sum of all positive log entries
+ *  - spent:  sum of |negative| log entries
+ *  - topBid: the single most expensive spend { dkp, name, date } — item name
+ *            from the auction item, falling back to the log comment for older
+ *            entries without an item object; ties resolved to the most recent.
+ * Returns { discordId: { earned, spent, topBid | null } }.
+ */
+function calculateDkpStats(playersData) {
+  const stats = {};
+  for (const p of (playersData || [])) {
+    const pid = String(p && p.player || "").trim();
+    if (!pid) continue;
+    let earned = 0, spent = 0, top = null;
+    for (const lg of (p.log || [])) {
+      const dkp = Number(lg.dkp || 0);
+      if (dkp > 0) {
+        earned += dkp;
+      } else if (dkp < 0) {
+        const abs = -dkp;
+        spent += abs;
+        if (!top || abs > top.dkp || (abs === top.dkp && Number(lg.date || 0) > top.date)) {
+          top = {
+            dkp: abs,
+            name: String((lg.item && lg.item.name) || lg.comment || "?"),
+            date: Number(lg.date || 0),
+          };
+        }
+      }
+    }
+    stats[pid] = { earned, spent, topBid: top };
+  }
+  return stats;
+}
 
 /**
  * For each player, finds the date (ms) of their last log entry
@@ -392,9 +440,25 @@ function completeRosterFromDiscord(playersData, attendance, lastDKPDateMap) {
   // Note written on the RA cell (shown as a tooltip in the web roster):
   // per-player attendance metrics complementing the guild-window RA in the cell.
   const buildRaNote = (id) => {
-    if (!attendance || !attendance.lifetime || attendance.lifetime[id] == null) return "";
-    return "1y RA = " + attendance.lifetime[id] + "%\n" +
-           "12w raid RA = " + attendance.ra12[id] + "%";
+    if (!attendance || !attendance.d30 || attendance.d30[id] == null) return "";
+    return "30d RA = " + attendance.d30[id] + "%";
+  };
+
+  // Note written on the DKP cell: the player's lifetime DKP economy.
+  const dkpStats = calculateDkpStats(playersData);
+  const buildDkpNote = (id) => {
+    const s = dkpStats[id];
+    if (!s) return "";
+    let note = "Lifetime earned = " + Math.round(s.earned) + " DKP\n" +
+               "Lifetime spent = " + Math.round(s.spent) + " DKP";
+    if (s.earned > 0) {
+      note += "\nSpent/earned = " + Math.floor((s.spent / s.earned) * 100 + 1e-9) + "%";
+    }
+    if (s.topBid) {
+      note += "\nTop bid: " + Math.round(s.topBid.dkp) + " DKP — " + s.topBid.name +
+              " (" + Utilities.formatDate(new Date(s.topBid.date), Session.getScriptTimeZone(), "yyyy-MM-dd") + ")";
+    }
+    return note;
   };
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const rosterSheet = ss.getSheetByName(CONFIG.SHEETS.ROSTER);
@@ -467,7 +531,8 @@ function completeRosterFromDiscord(playersData, attendance, lastDKPDateMap) {
 
     rawById[discordId] = {
       displayName: m.displayName, guildRole: m.guildRole, dkp,
-      ra: attPercent / 100, raNote: buildRaNote(discordId), lastDate
+      ra: attPercent / 100, raNote: buildRaNote(discordId),
+      dkpNote: buildDkpNote(discordId), lastDate
     };
     activeIds.add(discordId);
   }
@@ -475,18 +540,20 @@ function completeRosterFromDiscord(playersData, attendance, lastDKPDateMap) {
   // --- Prepare output columns (2D arrays) ---
   const outName     = new Array(numData);
   const outDKP      = new Array(numData);
+  const outDKPNotes = new Array(numData);
   const outRA       = new Array(numData);
   const outRANotes  = new Array(numData);
   const outRole     = new Array(numData);
   const outActivity = new Array(numData);
   const outNotes    = new Array(numData);
 
-  // init with existing values. RA notes start empty: this sync owns them, so
-  // rows without a matched member get theirs cleared (no stale metrics).
+  // init with existing values. RA/DKP notes start empty: this sync owns them,
+  // so rows without a matched member get theirs cleared (no stale metrics).
   for (let i = 0; i < numData; i++) {
     const row = rosterData[i] || [];
     outName[i]     = [row[colName] ?? nameVals[i][0] ?? ""];
     outDKP[i]      = [row[colDKP] ?? ""];
+    outDKPNotes[i] = [""];
     outRA[i]       = [row[colRA] ?? ""];
     outRANotes[i]  = [""];
     outRole[i]     = [row[colGuildRole] ?? ""];
@@ -509,6 +576,7 @@ function completeRosterFromDiscord(playersData, attendance, lastDKPDateMap) {
     if (idx != null) {
       outName[idx] = [payload.displayName];
       outDKP[idx]  = [payload.dkp];
+      outDKPNotes[idx] = [payload.dkpNote];
       outRA[idx]   = [payload.ra];
       outRANotes[idx] = [payload.raNote];
       outRole[idx] = [payload.guildRole];
@@ -531,6 +599,7 @@ function completeRosterFromDiscord(playersData, attendance, lastDKPDateMap) {
   const newRows = [];
   const newNotes = [];
   const newRANotes = [];
+  const newDKPNotes = [];
   for (const discordId in rawById) {
     if (seen.has(discordId)) continue;
     const payload = rawById[discordId];
@@ -543,12 +612,14 @@ function completeRosterFromDiscord(playersData, attendance, lastDKPDateMap) {
     newRows.push(rowValues);
     newNotes.push([`Discord ID: ${discordId}`]);
     newRANotes.push([payload.raNote]);
+    newDKPNotes.push([payload.dkpNote]);
   }
 
   // --- Batch writes (a few calls instead of thousands) ---
   if (numData > 0) {
     rosterSheet.getRange(dataStart, colName + 1, numData, 1).setValues(outName);
     rosterSheet.getRange(dataStart, colDKP + 1, numData, 1).setValues(outDKP);
+    rosterSheet.getRange(dataStart, colDKP + 1, numData, 1).setNotes(outDKPNotes);
     rosterSheet.getRange(dataStart, colRA + 1, numData, 1).setValues(outRA).setNumberFormat("0%");
     rosterSheet.getRange(dataStart, colRA + 1, numData, 1).setNotes(outRANotes);
     rosterSheet.getRange(dataStart, colGuildRole + 1, numData, 1).setValues(outRole);
@@ -559,6 +630,7 @@ function completeRosterFromDiscord(playersData, attendance, lastDKPDateMap) {
   if (newRows.length) {
     const startRow = rosterSheet.getLastRow() + 1;
     rosterSheet.getRange(startRow, 1, newRows.length, headers.length).setValues(newRows);
+    rosterSheet.getRange(startRow, colDKP + 1, newRows.length, 1).setNotes(newDKPNotes);
     rosterSheet.getRange(startRow, colRA + 1, newRows.length, 1).setNumberFormat("0%");
     rosterSheet.getRange(startRow, colRA + 1, newRows.length, 1).setNotes(newRANotes);
     rosterSheet.getRange(startRow, colActivity + 1, newRows.length, 1).setNumberFormat("yy-MM-dd");

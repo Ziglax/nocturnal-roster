@@ -133,12 +133,16 @@ best 8 of the last 10 weeks); **earned DKP** and **duration** per raid → Raid 
   day, with an influence proportional to the ticks already raided — and weeks
   without guild raids never count against anyone. The **RA column** shows the
   "raid RA" over **all guild ticks of the last 10 raid-weeks**: new joiners ramp
-  up as they accumulate ticks (by design — `1y RA` offers the per-player view),
+  up as they accumulate ticks (by design — `30d RA` offers the short-term view),
   and every player's **2 worst weeks are forgiven** ("best 8 of 10", so up to
-  two vacation weeks never hurt). The **RA cell note** (tooltip in
-  the web roster) carries two complementary metrics: `1y RA` (since the player's
-  first raid, **capped at the last year**, no forgiveness) and `12w raid RA`
-  (same rule as the RA column, over the last 12 raid-weeks).
+  two vacation weeks never hurt). The **RA cell note** (tooltip in the web
+  roster) carries one complementary metric: `30d RA` (attended ÷ total guild
+  ticks over the **last 30 days exactly** — or since the player's first tick if
+  they joined more recently — day-precise, no week bucketing, no forgiveness).
+- **DKP cell note** (tooltip in the web roster) — the player's lifetime DKP
+  economy: total earned, total spent, spent/earned ratio, and their single most
+  expensive bid (value, item name — from the auction item or the log comment for
+  older entries — and date).
 - **DKP / RA / status** — `M` / `M2` are main-character statuses; `MIN_RA` in `config.js`
   sets the RA needed to appear on the DKP lists.
 - **Caching** — `getRosterData()` is serialized and split into <100 KB chunks (CacheService
