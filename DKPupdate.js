@@ -109,23 +109,27 @@ function isoWeekKey(ms, tz) {
 }
 
 /**
- * Attendance metrics. All are TICK-WEIGHTED ratios over windows of completed
- * ISO weeks (Monday-start, script TZ): metric = player's Tick/Start events /
- * guild's Tick/Start events within the window — so busier weeks weigh more
- * than light ones. The in-progress week is excluded everywhere. Weeks with no
- * guild raids don't exist as buckets and never count against anyone (windows
- * are counted in RAID-weeks, not calendar weeks).
+ * Attendance metrics. All are TICK-WEIGHTED ratios over windows of ISO weeks
+ * (Monday-start, script TZ): metric = player's Tick/Start events / guild's
+ * Tick/Start events within the window — so busier weeks weigh more than light
+ * ones. The IN-PROGRESS week counts as it fills, so RA moves day by day: its
+ * influence stays proportional to the ticks already raided, and the worst-week
+ * forgiveness (ties drop the heavier week) absorbs the haven't-raided-yet case
+ * for regulars. Weeks with no guild raids don't exist as buckets and never
+ * count against anyone (windows are counted in RAID-weeks, not calendar weeks).
  *
- * Returns { ra, personal, d30, mo3 }, each mapping discordId -> integer percent:
- *  - ra:       guild's last 8 completed raid-weeks, IGNORING the 2 lightest of
- *              them (fewest total events — same weeks dropped for everyone), so
- *              an off-week with a single short raid doesn't skew the ratio.
- *              Shown in the Roster RA column and drives DKP-list eligibility.
- *              Recent recruits ramp up by design (pre-join ticks stay in the
- *              denominator).
- *  - personal: since the player's FIRST recorded attendance — fair to recruits.
- *  - d30:      guild's last 4 completed raid-weeks.
- *  - mo3:      guild's last 12 completed raid-weeks.
+ * Returns { ra, lifetime, ra12 }, each mapping discordId -> integer percent:
+ *  - ra:       "raid RA" over the guild's last 10 raid-weeks (the in-progress
+ *              week included, weighted by its ticks so far). The
+ *              player's window starts at their FIRST attended week (recruits
+ *              are measured on their own weeks only), and their worst weeks
+ *              are forgiven progressively with tenure, 2 per 10 weeks (1-4
+ *              weeks: none, 5-9: one, 10+: two) — "best 8 of 10" for
+ *              full-tenure raiders, tick-weighted. Shown in the Roster RA
+ *              column; drives DKP-list eligibility.
+ *  - ra12:     same rule over the last 12 raid-weeks.
+ *  - lifetime: plain ratio over every guild tick since the player's first
+ *              attended week (no drop).
  */
 function calculateAttendance(raidsData) {
   const tz = Session.getScriptTimeZone();
@@ -157,7 +161,7 @@ function calculateAttendance(raidsData) {
       if (!players.length) continue;
 
       const wk = weekKeyOf(t);
-      if (wk >= currentWeek) continue; // in-progress (or future) week: ignore
+      if (wk > currentWeek) continue; // future-dated noise: ignore
 
       weekTotals[wk] = (weekTotals[wk] || 0) + 1;
       if (!weekPlayerCounts[wk]) weekPlayerCounts[wk] = {};
@@ -168,8 +172,8 @@ function calculateAttendance(raidsData) {
   }
 
   const weeks = Object.keys(weekTotals).sort(); // chronological ("YYYY-Www")
-  const ra = {}, personal = {}, d30 = {}, mo3 = {};
-  if (!weeks.length) return { ra, personal, d30, mo3 };
+  const ra = {}, lifetime = {}, ra12 = {};
+  if (!weeks.length) return { ra, lifetime, ra12 };
 
   const seen = new Set();
   weeks.forEach(wk => Object.keys(weekPlayerCounts[wk]).forEach(pid => seen.add(pid)));
@@ -186,24 +190,38 @@ function calculateAttendance(raidsData) {
     return total ? Math.floor((attended / total) * 100 + 1e-9) : 0;
   };
 
-  // ra window: the guild's last 8 completed raid-weeks minus the 2 lightest
-  // (fewest total events). Identical for every player; ties resolve to the
-  // older week (stable sort), so the result is deterministic.
-  const raWindow = weeks.slice(-8);
-  const raWeeks = raWindow.length > 2
-    ? [...raWindow].sort((a, b) => weekTotals[a] - weekTotals[b]).slice(2)
-    : raWindow;
+  // "raid RA" over the guild's last n raid-weeks:
+  // - the player's window starts at their FIRST attended week, so recruits are
+  //   measured on their own weeks only (no pre-join dilution);
+  // - the player's WORST weeks are forgiven progressively with tenure in the
+  //   window, at the global rate of 2 forgiven per 10 weeks (1 per 5, capped
+  //   at 2): 1-4 weeks -> 0 dropped, 5-9 -> 1, 10+ -> 2 ("up to two weeks of
+  //   vacation" for full-tenure raiders). Worst = lowest weekly %; on ties the
+  //   heavier week (more total ticks) is dropped, which favors the player and
+  //   stays deterministic.
+  const raidRa = (pid, firstIdx, n) => {
+    let wks = weeks.slice(Math.max(weeks.length - n, firstIdx));
+    if (!wks.length) return 0;
+    const drop = Math.min(2, Math.floor(wks.length / 5));
+    if (drop > 0) {
+      const weeklyPct = (wk) => (weekPlayerCounts[wk][pid] || 0) / weekTotals[wk];
+      const dropped = new Set(
+        [...wks].sort((a, b) => (weeklyPct(a) - weeklyPct(b)) || (weekTotals[b] - weekTotals[a])).slice(0, drop)
+      );
+      wks = wks.filter(wk => !dropped.has(wk));
+    }
+    return ratio(pid, wks);
+  };
 
   for (const pid of seen) {
-    ra[pid]  = ratio(pid, raWeeks);
-    d30[pid] = ratio(pid, weeks.slice(-4));
-    mo3[pid] = ratio(pid, weeks.slice(-12));
-    // personal: since the player's first recorded raid-week
-    const first = weeks.findIndex(wk => (weekPlayerCounts[wk][pid] || 0) > 0);
-    personal[pid] = first === -1 ? 0 : ratio(pid, weeks.slice(first));
+    const firstIdx = weeks.findIndex(wk => (weekPlayerCounts[wk][pid] || 0) > 0);
+    ra[pid]   = raidRa(pid, firstIdx, 10);
+    ra12[pid] = raidRa(pid, firstIdx, 12);
+    // lifetime: every guild tick since the player's first attended week
+    lifetime[pid] = ratio(pid, weeks.slice(firstIdx));
   }
 
-  return { ra, personal, d30, mo3 };
+  return { ra, lifetime, ra12 };
 }
 
 
@@ -376,10 +394,9 @@ function completeRosterFromDiscord(playersData, attendance, lastDKPDateMap) {
   // Note written on the RA cell (shown as a tooltip in the web roster):
   // per-player attendance metrics complementing the guild-window RA in the cell.
   const buildRaNote = (id) => {
-    if (!attendance || attendance.personal == null || attendance.personal[id] == null) return "";
-    return "personal RA = " + attendance.personal[id] + "%\n" +
-           "30d RA = " + attendance.d30[id] + "%\n" +
-           "3mo RA = " + attendance.mo3[id] + "%";
+    if (!attendance || !attendance.lifetime || attendance.lifetime[id] == null) return "";
+    return "Lifetime RA = " + attendance.lifetime[id] + "%\n" +
+           "12w raid RA = " + attendance.ra12[id] + "%";
   };
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const rosterSheet = ss.getSheetByName(CONFIG.SHEETS.ROSTER);
