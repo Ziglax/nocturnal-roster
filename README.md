@@ -126,8 +126,18 @@ best 8 of the last 10 weeks); **earned DKP** and **duration** per raid → Raid 
   `Discord ID: <id>`. The display name can change; the ID is the stable key (with a
   name-based fallback). The ID is **stripped from the JSON payload** before it reaches the
   frontend (it stays in the sheet).
-- **Attendance (RA)** — average of a player's **best 8 of the last 10 weeks** of
-  `Tick`/`Start` events.
+- **Attendance (RA)** — all metrics are **tick-weighted ratios** (player's
+  `Tick`/`Start` events ÷ guild's events in the window), so busier weeks weigh
+  more than light ones. Windows are counted in **completed ISO raid-weeks**
+  (Monday-start, script timezone): the in-progress week is excluded and weeks
+  without guild raids never count against anyone. The **RA column** shows the
+  ratio over the guild's **last 8 raid-weeks, ignoring the 2 lightest of them**
+  (fewest total events — the same weeks are dropped for everyone, so an odd
+  off-week doesn't skew the metric). Pre-join ticks stay in the denominator, so
+  recent recruits ramp up by design. The **RA cell note**
+  (tooltip in the web roster) carries three complementary metrics:
+  `personal RA` (since the player's first recorded raid — fair to recruits),
+  `30d RA` (last 4 raid-weeks) and `3mo RA` (last 12 raid-weeks).
 - **DKP / RA / status** — `M` / `M2` are main-character statuses; `MIN_RA` in `config.js`
   sets the RA needed to appear on the DKP lists.
 - **Caching** — `getRosterData()` is serialized and split into <100 KB chunks (CacheService

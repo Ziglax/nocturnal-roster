@@ -55,7 +55,7 @@ function exportRosterStatsFromLatestDump() {
     currentById[pid] = (p && typeof p.current === "number") ? p.current : 0;
   }
 
-  const attendanceMap = calculateAttendance(raidsData); // pid -> integer %
+  const attendanceMap = calculateAttendance(raidsData).ra; // pid -> integer % (guild-window RA)
 
   // --- 3) Total ticks + since X (Start+Tick) ---
   const ticksTotalById = {};
@@ -67,10 +67,11 @@ function exportRosterStatsFromLatestDump() {
 
       const t = Number(ev && ev.date || 0);
       const isSince = t >= sinceMs;
-      const players = Array.isArray(ev && ev.players) ? ev.players : [];
+      // Same hygiene as calculateAttendance: a duplicated id within one event
+      // must not count twice.
+      const players = Array.isArray(ev && ev.players) ? [...new Set(ev.players.map(String))] : [];
 
-      for (const pidRaw of players) {
-        const pid = String(pidRaw);
+      for (const pid of players) {
         ticksTotalById[pid] = (ticksTotalById[pid] || 0) + 1;
         if (isSince) ticksSinceById[pid] = (ticksSinceById[pid] || 0) + 1;
       }

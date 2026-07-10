@@ -61,12 +61,18 @@ function parseLatestRaidDataAndUpdateRoster(force) {
     }
     const { playersData, raidsData } = backup;
     
-    // 1) compute attendance
-    const attendanceMap  = calculateAttendance(raidsData);
+    // 1) compute attendance metrics ({ra, personal, d30, mo3})
+    const attendance     = calculateAttendance(raidsData);
+    // Empty/truncated raids.json would zero every RA and wipe all RA notes,
+    // then mark the ZIP processed (unrecoverable until the next backup): abort.
+    if (!Object.keys(attendance.ra).length) {
+      Logger.log("No qualifying attendance events in backup — aborting roster update (ZIP not marked processed).");
+      return;
+    }
     // 2) compute the date of the last DKP gain > 0
     const lastDKPDateMap = calculateLastPositiveDKPDate(playersData);
     // 3) update + complete the roster
-    completeRosterFromDiscord(playersData, attendanceMap, lastDKPDateMap);
+    completeRosterFromDiscord(playersData, attendance, lastDKPDateMap);
     // 4) update the stats
     updateRaidSummary(playersData, raidsData);
     // 5) rebuild the cache so visitors see the new data immediately
@@ -88,87 +94,116 @@ function parseLatestRaidDataAndUpdateRoster(force) {
 
 
 /**
- * Attendance = average of a player's best 8 weeks among the last 10 weeks.
- * A "week" is grouped by ISO-like week key (YYYY-Www) in the script's timezone.
- * For each week: % = player_week_ticks / total_week_ticks.
- * Then take the top 8 weekly % (or fewer if not enough weeks) and average them.
+ * ISO-8601 week key (e.g. "2026-W28") for a timestamp, computed on the calendar
+ * date in the given timezone. ISO weeks start MONDAY; the week-year is the year
+ * of that week's Thursday. Zero-padded so keys sort chronologically as strings.
+ */
+function isoWeekKey(ms, tz) {
+  const parts = Utilities.formatDate(new Date(ms), tz, "yyyy-MM-dd").split("-");
+  const d = new Date(Date.UTC(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2])));
+  const dayNum = d.getUTCDay() || 7;            // Mon=1 .. Sun=7
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);    // shift to this week's Thursday
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const week = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  return d.getUTCFullYear() + "-W" + String(week).padStart(2, "0");
+}
+
+/**
+ * Attendance metrics. All are TICK-WEIGHTED ratios over windows of completed
+ * ISO weeks (Monday-start, script TZ): metric = player's Tick/Start events /
+ * guild's Tick/Start events within the window — so busier weeks weigh more
+ * than light ones. The in-progress week is excluded everywhere. Weeks with no
+ * guild raids don't exist as buckets and never count against anyone (windows
+ * are counted in RAID-weeks, not calendar weeks).
+ *
+ * Returns { ra, personal, d30, mo3 }, each mapping discordId -> integer percent:
+ *  - ra:       guild's last 8 completed raid-weeks, IGNORING the 2 lightest of
+ *              them (fewest total events — same weeks dropped for everyone), so
+ *              an off-week with a single short raid doesn't skew the ratio.
+ *              Shown in the Roster RA column and drives DKP-list eligibility.
+ *              Recent recruits ramp up by design (pre-join ticks stay in the
+ *              denominator).
+ *  - personal: since the player's FIRST recorded attendance — fair to recruits.
+ *  - d30:      guild's last 4 completed raid-weeks.
+ *  - mo3:      guild's last 12 completed raid-weeks.
  */
 function calculateAttendance(raidsData) {
   const tz = Session.getScriptTimeZone();
-  const now = Date.now();
-  const TEN_WEEKS_MS = 10 * 7 * 24 * 60 * 60 * 1000;
-  const windowStart = now - TEN_WEEKS_MS;
-
-  // Per-week totals and per-week per-player counts
-  const weekTotals = {};            // weekKey => total qualifying events
-  const weekPlayerCounts = {};      // weekKey => { playerId => qualifying events count }
-
-  // Helper: only count "Tick" or "Start"
+  const currentWeek = isoWeekKey(Date.now(), tz);
   const isTickOrStart = (c) => c === "Tick" || c === "Start";
 
-  // Build weekly buckets from the last 10 weeks
+  // --- Bucket every qualifying event by ISO week (full history) ---
+  const weekTotals = {};       // weekKey -> total qualifying events
+  const weekPlayerCounts = {}; // weekKey -> { playerId -> events attended }
+
+  // Memoize week keys per hour bucket: isoWeekKey costs one Utilities.formatDate
+  // Java-bridge call, and the full-history scan has ~thousands of events. Safe
+  // because Europe/Paris UTC offsets are whole hours, so one hour bucket always
+  // maps to a single local calendar date.
+  const weekKeyCache = {};
+  const weekKeyOf = (ms) => {
+    const h = Math.floor(ms / 3600000);
+    return weekKeyCache[h] || (weekKeyCache[h] = isoWeekKey(ms, tz));
+  };
+
   for (const raid of raidsData || []) {
     for (const ev of (raid.attendance || [])) {
       const t = Number(ev.date || 0);
-      const c = String(ev.comment || "");
-      if (t < windowStart || !isTickOrStart(c)) continue;
+      if (!t || !isTickOrStart(String(ev.comment || ""))) continue;
 
-      // Week key in script timezone. Uses week-year (YYYY) + week number (ww).
-      // This is good enough for bucketing and lexicographic sorting.
-      const weekKey = Utilities.formatDate(new Date(t), tz, "YYYY-'W'ww");
+      // Dedup ids within one event (a duplicated id must not count twice) and
+      // skip attendee-less events (bot noise that would inflate the denominator).
+      const players = Array.isArray(ev.players) ? [...new Set(ev.players.map(String))] : [];
+      if (!players.length) continue;
 
-      weekTotals[weekKey] = (weekTotals[weekKey] || 0) + 1;
+      const wk = weekKeyOf(t);
+      if (wk >= currentWeek) continue; // in-progress (or future) week: ignore
 
-      const players = Array.isArray(ev.players) ? ev.players : [];
-      if (!weekPlayerCounts[weekKey]) weekPlayerCounts[weekKey] = {};
+      weekTotals[wk] = (weekTotals[wk] || 0) + 1;
+      if (!weekPlayerCounts[wk]) weekPlayerCounts[wk] = {};
       for (const pid of players) {
-        const k = String(pid);
-        weekPlayerCounts[weekKey][k] = (weekPlayerCounts[weekKey][k] || 0) + 1;
+        weekPlayerCounts[wk][pid] = (weekPlayerCounts[wk][pid] || 0) + 1;
       }
     }
   }
 
-  // Determine the last 10 weeks we actually saw ticks for
-  const allWeeksSorted = Object.keys(weekTotals).sort();         // lexicographic works with "YYYY-Www"
-  const lastWeeks = allWeeksSorted.slice(-10);
+  const weeks = Object.keys(weekTotals).sort(); // chronological ("YYYY-Www")
+  const ra = {}, personal = {}, d30 = {}, mo3 = {};
+  if (!weeks.length) return { ra, personal, d30, mo3 };
 
-  // If there are no weeks, everybody is 0
-  if (lastWeeks.length === 0) return {};
+  const seen = new Set();
+  weeks.forEach(wk => Object.keys(weekPlayerCounts[wk]).forEach(pid => seen.add(pid)));
 
-  // Collect player IDs that appeared at least once
-  const seenPlayers = new Set();
-  for (const wk of lastWeeks) {
-    const map = weekPlayerCounts[wk] || {};
-    Object.keys(map).forEach(pid => seenPlayers.add(pid));
+  // Tick-weighted ratio over a set of week keys, as a floored integer percent.
+  // The +1e-9 guards float error: an exact-integer ratio (e.g. 45%) can compute
+  // as 44.999999999999994 and floor to 44 — which matters at DKP thresholds.
+  const ratio = (pid, wks) => {
+    let attended = 0, total = 0;
+    for (const wk of wks) {
+      attended += (weekPlayerCounts[wk][pid] || 0);
+      total += weekTotals[wk];
+    }
+    return total ? Math.floor((attended / total) * 100 + 1e-9) : 0;
+  };
+
+  // ra window: the guild's last 8 completed raid-weeks minus the 2 lightest
+  // (fewest total events). Identical for every player; ties resolve to the
+  // older week (stable sort), so the result is deterministic.
+  const raWindow = weeks.slice(-8);
+  const raWeeks = raWindow.length > 2
+    ? [...raWindow].sort((a, b) => weekTotals[a] - weekTotals[b]).slice(2)
+    : raWindow;
+
+  for (const pid of seen) {
+    ra[pid]  = ratio(pid, raWeeks);
+    d30[pid] = ratio(pid, weeks.slice(-4));
+    mo3[pid] = ratio(pid, weeks.slice(-12));
+    // personal: since the player's first recorded raid-week
+    const first = weeks.findIndex(wk => (weekPlayerCounts[wk][pid] || 0) > 0);
+    personal[pid] = first === -1 ? 0 : ratio(pid, weeks.slice(first));
   }
 
-  const attendanceMap = {}; // pid => integer %
-
-  // For each seen player, compute weekly %s, pick best 8, average
-  for (const pid of seenPlayers) {
-    const weeklyPercents = [];
-    for (const wk of lastWeeks) {
-      const total = weekTotals[wk] || 0;
-      if (total === 0) continue; // should not happen because we built lastWeeks from totals>0
-      const playerCount = (weekPlayerCounts[wk] && weekPlayerCounts[wk][pid]) ? weekPlayerCounts[wk][pid] : 0;
-      weeklyPercents.push((playerCount / total) * 100);
-    }
-
-    // If we somehow have no data points, mark 0
-    if (weeklyPercents.length === 0) {
-      attendanceMap[pid] = 0;
-      continue;
-    }
-
-    // Take the best 8 (or fewer if not enough weeks)
-    weeklyPercents.sort((a, b) => b - a);
-    const top = weeklyPercents.slice(0, 8);
-    const avg = top.reduce((s, v) => s + v, 0) / top.length;
-
-    attendanceMap[pid] = Math.floor(avg);
-  }
-
-  return attendanceMap;
+  return { ra, personal, d30, mo3 };
 }
 
 
@@ -337,7 +372,15 @@ function updateRaidSummary(playersData, raidsData) {
   sh.autoResizeColumns(1, headers.length);
 }
 
-function completeRosterFromDiscord(playersData, attendanceMap, lastDKPDateMap) {
+function completeRosterFromDiscord(playersData, attendance, lastDKPDateMap) {
+  // Note written on the RA cell (shown as a tooltip in the web roster):
+  // per-player attendance metrics complementing the guild-window RA in the cell.
+  const buildRaNote = (id) => {
+    if (!attendance || attendance.personal == null || attendance.personal[id] == null) return "";
+    return "personal RA = " + attendance.personal[id] + "%\n" +
+           "30d RA = " + attendance.d30[id] + "%\n" +
+           "3mo RA = " + attendance.mo3[id] + "%";
+  };
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const rosterSheet = ss.getSheetByName(CONFIG.SHEETS.ROSTER);
   const rawSheet    = ss.getSheetByName(CONFIG.SHEETS.RAW_DISCORD);
@@ -402,11 +445,15 @@ function completeRosterFromDiscord(playersData, attendanceMap, lastDKPDateMap) {
   for (const m of members) {
     const discordId = m.discordId;
     const dkp = currentById[discordId] || 0;
-    const attPercent = (attendanceMap && attendanceMap[discordId] != null) ? (Number(attendanceMap[discordId]) || 0) : 0;
+    const attPercent = (attendance && attendance.ra && attendance.ra[discordId] != null)
+      ? (Number(attendance.ra[discordId]) || 0) : 0;
     const lastTs = (lastDKPDateMap && lastDKPDateMap[discordId]) ? (Number(lastDKPDateMap[discordId]) || 0) : 0;
     const lastDate = lastTs > 0 ? new Date(lastTs) : null;
 
-    rawById[discordId] = { displayName: m.displayName, guildRole: m.guildRole, dkp, ra: attPercent / 100, lastDate };
+    rawById[discordId] = {
+      displayName: m.displayName, guildRole: m.guildRole, dkp,
+      ra: attPercent / 100, raNote: buildRaNote(discordId), lastDate
+    };
     activeIds.add(discordId);
   }
 
@@ -414,16 +461,19 @@ function completeRosterFromDiscord(playersData, attendanceMap, lastDKPDateMap) {
   const outName     = new Array(numData);
   const outDKP      = new Array(numData);
   const outRA       = new Array(numData);
+  const outRANotes  = new Array(numData);
   const outRole     = new Array(numData);
   const outActivity = new Array(numData);
   const outNotes    = new Array(numData);
 
-  // init with existing values
+  // init with existing values. RA notes start empty: this sync owns them, so
+  // rows without a matched member get theirs cleared (no stale metrics).
   for (let i = 0; i < numData; i++) {
     const row = rosterData[i] || [];
     outName[i]     = [row[colName] ?? nameVals[i][0] ?? ""];
     outDKP[i]      = [row[colDKP] ?? ""];
     outRA[i]       = [row[colRA] ?? ""];
+    outRANotes[i]  = [""];
     outRole[i]     = [row[colGuildRole] ?? ""];
     outActivity[i] = [row[colActivity] ?? ""];
     outNotes[i]    = [nameNotes[i] ? nameNotes[i][0] : ""];
@@ -445,6 +495,7 @@ function completeRosterFromDiscord(playersData, attendanceMap, lastDKPDateMap) {
       outName[idx] = [payload.displayName];
       outDKP[idx]  = [payload.dkp];
       outRA[idx]   = [payload.ra];
+      outRANotes[idx] = [payload.raNote];
       outRole[idx] = [payload.guildRole];
       outActivity[idx] = [payload.lastDate || ""];
       outNotes[idx] = [upsertDiscordIdInNote(outNotes[idx][0], discordId)];
@@ -464,6 +515,7 @@ function completeRosterFromDiscord(playersData, attendanceMap, lastDKPDateMap) {
   // --- New members -> append in one block ---
   const newRows = [];
   const newNotes = [];
+  const newRANotes = [];
   for (const discordId in rawById) {
     if (seen.has(discordId)) continue;
     const payload = rawById[discordId];
@@ -475,6 +527,7 @@ function completeRosterFromDiscord(playersData, attendanceMap, lastDKPDateMap) {
     rowValues[colActivity]  = payload.lastDate || "";
     newRows.push(rowValues);
     newNotes.push([`Discord ID: ${discordId}`]);
+    newRANotes.push([payload.raNote]);
   }
 
   // --- Batch writes (a few calls instead of thousands) ---
@@ -482,6 +535,7 @@ function completeRosterFromDiscord(playersData, attendanceMap, lastDKPDateMap) {
     rosterSheet.getRange(dataStart, colName + 1, numData, 1).setValues(outName);
     rosterSheet.getRange(dataStart, colDKP + 1, numData, 1).setValues(outDKP);
     rosterSheet.getRange(dataStart, colRA + 1, numData, 1).setValues(outRA).setNumberFormat("0%");
+    rosterSheet.getRange(dataStart, colRA + 1, numData, 1).setNotes(outRANotes);
     rosterSheet.getRange(dataStart, colGuildRole + 1, numData, 1).setValues(outRole);
     rosterSheet.getRange(dataStart, colActivity + 1, numData, 1).setValues(outActivity).setNumberFormat("yy-MM-dd");
     rosterSheet.getRange(dataStart, colName + 1, numData, 1).setNotes(outNotes);
@@ -491,6 +545,7 @@ function completeRosterFromDiscord(playersData, attendanceMap, lastDKPDateMap) {
     const startRow = rosterSheet.getLastRow() + 1;
     rosterSheet.getRange(startRow, 1, newRows.length, headers.length).setValues(newRows);
     rosterSheet.getRange(startRow, colRA + 1, newRows.length, 1).setNumberFormat("0%");
+    rosterSheet.getRange(startRow, colRA + 1, newRows.length, 1).setNotes(newRANotes);
     rosterSheet.getRange(startRow, colActivity + 1, newRows.length, 1).setNumberFormat("yy-MM-dd");
     rosterSheet.getRange(startRow, colName + 1, newRows.length, 1).setNotes(newNotes);
   }
