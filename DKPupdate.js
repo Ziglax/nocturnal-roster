@@ -119,17 +119,15 @@ function isoWeekKey(ms, tz) {
  * count against anyone (windows are counted in RAID-weeks, not calendar weeks).
  *
  * Returns { ra, lifetime, ra12 }, each mapping discordId -> integer percent:
- *  - ra:       "raid RA" over the guild's last 10 raid-weeks (the in-progress
- *              week included, weighted by its ticks so far). The
- *              player's window starts at their FIRST attended week (recruits
- *              are measured on their own weeks only), and their worst weeks
- *              are forgiven progressively with tenure, 2 per 10 weeks (1-4
- *              weeks: none, 5-9: one, 10+: two) — "best 8 of 10" for
- *              full-tenure raiders, tick-weighted. Shown in the Roster RA
- *              column; drives DKP-list eligibility.
+ *  - ra:       "raid RA" over ALL guild ticks of the last 10 raid-weeks (the
+ *              in-progress week included, weighted by its ticks so far). New
+ *              joiners ramp up as they accumulate ticks — intended; lifetime
+ *              offers the per-player view. The player's 2 worst weeks are
+ *              forgiven ("best 8 of 10"). Shown in the Roster RA column;
+ *              drives DKP-list eligibility.
  *  - ra12:     same rule over the last 12 raid-weeks.
- *  - lifetime: plain ratio over every guild tick since the player's first
- *              attended week (no drop).
+ *  - lifetime: plain ratio (no drop) since the player's first attended week,
+ *              capped at the last 365 days.
  */
 function calculateAttendance(raidsData) {
   const tz = Session.getScriptTimeZone();
@@ -190,35 +188,35 @@ function calculateAttendance(raidsData) {
     return total ? Math.floor((attended / total) * 100 + 1e-9) : 0;
   };
 
-  // "raid RA" over the guild's last n raid-weeks:
-  // - the player's window starts at their FIRST attended week, so recruits are
-  //   measured on their own weeks only (no pre-join dilution);
-  // - the player's WORST weeks are forgiven progressively with tenure in the
-  //   window, at the global rate of 2 forgiven per 10 weeks (1 per 5, capped
-  //   at 2): 1-4 weeks -> 0 dropped, 5-9 -> 1, 10+ -> 2 ("up to two weeks of
-  //   vacation" for full-tenure raiders). Worst = lowest weekly %; on ties the
-  //   heavier week (more total ticks) is dropped, which favors the player and
-  //   stays deterministic.
-  const raidRa = (pid, firstIdx, n) => {
-    let wks = weeks.slice(Math.max(weeks.length - n, firstIdx));
-    if (!wks.length) return 0;
-    const drop = Math.min(2, Math.floor(wks.length / 5));
-    if (drop > 0) {
+  // "raid RA" over ALL guild ticks of the last n raid-weeks — the same window
+  // for everyone: a new joiner ramps up as they accumulate ticks (intended;
+  // 1y RA offers the per-player perspective). The player's 2 WORST weeks are
+  // forgiven ("best 8 of 10"): lowest weekly % first; on ties the heavier week
+  // (more total ticks) is dropped, which favors the player and stays
+  // deterministic. (The length guard only avoids degenerate data.)
+  const raidRa = (pid, n) => {
+    let wks = weeks.slice(-n);
+    if (wks.length > 2) {
       const weeklyPct = (wk) => (weekPlayerCounts[wk][pid] || 0) / weekTotals[wk];
       const dropped = new Set(
-        [...wks].sort((a, b) => (weeklyPct(a) - weeklyPct(b)) || (weekTotals[b] - weekTotals[a])).slice(0, drop)
+        [...wks].sort((a, b) => (weeklyPct(a) - weeklyPct(b)) || (weekTotals[b] - weekTotals[a])).slice(0, 2)
       );
       wks = wks.filter(wk => !dropped.has(wk));
     }
     return ratio(pid, wks);
   };
 
+  // Lifetime RA looks back one year at most.
+  const yearCutoff = isoWeekKey(Date.now() - 365 * 86400000, tz);
+  let yearStartIdx = weeks.findIndex(wk => wk >= yearCutoff);
+  if (yearStartIdx === -1) yearStartIdx = weeks.length;
+
   for (const pid of seen) {
+    ra[pid]   = raidRa(pid, 10);
+    ra12[pid] = raidRa(pid, 12);
+    // lifetime: since the player's first attended week, capped at the last year
     const firstIdx = weeks.findIndex(wk => (weekPlayerCounts[wk][pid] || 0) > 0);
-    ra[pid]   = raidRa(pid, firstIdx, 10);
-    ra12[pid] = raidRa(pid, firstIdx, 12);
-    // lifetime: every guild tick since the player's first attended week
-    lifetime[pid] = ratio(pid, weeks.slice(firstIdx));
+    lifetime[pid] = ratio(pid, weeks.slice(Math.max(firstIdx, yearStartIdx)));
   }
 
   return { ra, lifetime, ra12 };
@@ -395,7 +393,7 @@ function completeRosterFromDiscord(playersData, attendance, lastDKPDateMap) {
   // per-player attendance metrics complementing the guild-window RA in the cell.
   const buildRaNote = (id) => {
     if (!attendance || !attendance.lifetime || attendance.lifetime[id] == null) return "";
-    return "Lifetime RA = " + attendance.lifetime[id] + "%\n" +
+    return "1y RA = " + attendance.lifetime[id] + "%\n" +
            "12w raid RA = " + attendance.ra12[id] + "%";
   };
   const ss = SpreadsheetApp.getActiveSpreadsheet();
